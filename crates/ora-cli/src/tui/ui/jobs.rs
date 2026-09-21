@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use jiff::{SignedDurationRound, Timestamp, TimestampRound};
-use ora::proto::admin::v1::Job;
+use ora::proto::admin::v1::{Execution, Job};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{
@@ -9,19 +9,29 @@ use ratatui::{
         palette::tailwind::{self, SLATE},
     },
     symbols,
-    text::Line,
     widgets::{
-        Block, Borders, Cell, HighlightSpacing, Paragraph, Row, StatefulWidget, Table, TableState,
-        Widget,
+        Block, Borders, Cell, HighlightSpacing, Padding, Paragraph, Row, StatefulWidget, Table,
+        TableState, Widget, Wrap,
     },
 };
-use serde_json::Value;
+
+use crate::tui::ui::{
+    empty_message, execution_status_label, execution_status_style, field, format_time,
+    format_time_with_age, pretty_json, timestamp_of,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct JobTable {
     pub(crate) focused: bool,
+    pub(crate) loading: bool,
     pub(crate) state: TableState,
     pub(crate) jobs: Vec<Job>,
+}
+
+impl JobTable {
+    pub(crate) fn selected(&self) -> Option<&Job> {
+        self.jobs.get(self.state.selected()?)
+    }
 }
 
 impl Widget for &mut JobTable {
@@ -43,37 +53,37 @@ impl Widget for &mut JobTable {
                 Style::default()
             });
 
+        let block_inner = block.inner(left);
+
         let rows = self
             .jobs
             .iter()
-            .filter_map(|job| {
-                let def = job.job.as_ref()?;
+            .map(|job| {
+                // Every job gets a row, including one with no execution yet,
+                // so the highlighted line is always the job an action hits.
+                let target_time = job
+                    .job
+                    .as_ref()
+                    .and_then(|def| def.target_execution_time)
+                    .and_then(|ts| Timestamp::try_from(SystemTime::try_from(ts).ok()?).ok())
+                    .and_then(|ts| {
+                        ts.round(TimestampRound::new().smallest(jiff::Unit::Second))
+                            .ok()
+                    })
+                    .map(|ts| ts.strftime("%Y-%m-%d %H:%M:%S%:z").to_string())
+                    .unwrap_or_default();
 
-                let target_time =
-                    Timestamp::try_from(SystemTime::try_from(def.target_execution_time?).ok()?)
-                        .ok()?
-                        .round(TimestampRound::new().smallest(jiff::Unit::Second))
-                        .ok()?;
+                let status = job.executions.last().map(Execution::status);
 
-                let status = match job.executions.last()?.status() {
-                    ora::proto::admin::v1::ExecutionStatus::Unspecified
-                    | ora::proto::admin::v1::ExecutionStatus::Pending => "pending",
-                    ora::proto::admin::v1::ExecutionStatus::InProgress => "in-progress",
-                    ora::proto::admin::v1::ExecutionStatus::Succeeded => "succeeded",
-                    ora::proto::admin::v1::ExecutionStatus::Failed => "failed",
-                    ora::proto::admin::v1::ExecutionStatus::Cancelled => "cancelled",
-                };
-
-                Some(Row::new([
-                    Cell::new(target_time.strftime("%Y-%m-%d %H:%M:%S%:z").to_string()),
-                    Cell::new(status).style(match status {
-                        "succeeded" => Style::new().fg(tailwind::GREEN.c400),
-                        "failed" | "cancelled" => Style::new().fg(tailwind::RED.c400),
-                        "in-progress" => Style::new().fg(tailwind::YELLOW.c400),
-                        _ => Style::new().fg(tailwind::GRAY.c400),
-                    }),
+                Row::new([
+                    Cell::new(target_time),
+                    match status {
+                        Some(status) => Cell::new(execution_status_label(status))
+                            .style(execution_status_style(status)),
+                        None => Cell::new(""),
+                    },
                     Cell::new(job.id.clone()),
-                ]))
+                ])
             })
             .collect::<Vec<_>>();
 
@@ -84,6 +94,16 @@ impl Widget for &mut JobTable {
             .highlight_spacing(HighlightSpacing::Always);
 
         StatefulWidget::render(table, left, buf, &mut self.state);
+
+        if self.jobs.is_empty() {
+            empty_message(
+                self.loading,
+                "No jobs match the current filter.",
+                block_inner,
+                buf,
+            );
+        }
+
         JobDetails(self.state.selected().and_then(|i| self.jobs.get(i))).render(right, buf);
     }
 }
@@ -102,6 +122,7 @@ impl Widget for JobDetails<'_> {
             .borders(Borders::all())
             .border_set(symbols::border::PLAIN);
 
+        let inner = block.inner(area);
         block.render(area, buf);
 
         let Some(job) = self.0 else {
@@ -112,140 +133,106 @@ impl Widget for JobDetails<'_> {
             return;
         };
 
-        let layout = Layout::horizontal([
-            Constraint::Length(48),
-            Constraint::Fill(1),
-            Constraint::Fill(1),
-        ])
-        .margin(1);
-        let [meta, input, output] = layout.areas(area);
+        let mut meta = vec![
+            field("ID", job.id.clone()),
+            field("Created", format_time_with_age(job.created_at)),
+            field("Finished", finished_text(job)),
+        ];
 
-        let meta_layout = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Fill(1),
-        ])
-        .margin(1);
-
-        let [id_area, created_area, finished_area, labels_area] = meta_layout.areas(meta);
-
-        Paragraph::new(vec![Line::from(job.id.as_str())])
-            .block(
-                Block::new()
-                    .title("ID")
-                    .title_style(Style::new().bold())
-                    .borders(Borders::NONE),
-            )
-            .render(id_area, buf);
-
-        let created_at = job
-            .created_at
-            .and_then(|ts| Timestamp::try_from(SystemTime::try_from(ts).ok()?).ok())
-            .and_then(|ts| {
-                ts.round(TimestampRound::new().smallest(jiff::Unit::Second))
-                    .ok()
-            })
-            .unwrap_or_default();
-
-        Paragraph::new(Line::from(
-            created_at.strftime("%Y-%m-%d %H:%M:%S%:z").to_string(),
-        ))
-        .block(
-            Block::new()
-                .title("Created")
-                .title_style(Style::new().bold())
-                .borders(Borders::NONE),
-        )
-        .render(created_area, buf);
-
-        let target_time = job
-            .job
-            .as_ref()
-            .and_then(|def| {
-                Timestamp::try_from(SystemTime::try_from(def.target_execution_time?).ok()?).ok()
-            })
-            .unwrap_or_default();
-
-        let finished_at = job
-            .executions
-            .last()
-            .and_then(|exec| exec.succeeded_at.or(exec.failed_at).or(exec.cancelled_at))
-            .and_then(|ts| Timestamp::try_from(SystemTime::try_from(ts).ok()?).ok());
-
-        let finished_at_text = match finished_at {
-            Some(ts) => {
-                let duration = ts.duration_since(target_time);
-
-                let duration = duration
-                    .round(SignedDurationRound::new().smallest(jiff::Unit::Millisecond))
-                    .unwrap_or(duration);
-
-                let ts = ts
-                    .round(TimestampRound::new().smallest(jiff::Unit::Second))
-                    .unwrap_or(ts)
-                    .strftime("%Y-%m-%d %H:%M:%S%:z");
-
-                format!("{ts} ({duration:#})")
-            }
-            None => String::new(),
-        };
-
-        Paragraph::new(Line::from(finished_at_text))
-            .block(
-                Block::new()
-                    .title("Finished")
-                    .title_style(Style::new().bold())
-                    .borders(Borders::NONE),
-            )
-            .render(finished_area, buf);
-
-        let mut labels = Vec::new();
-
-        for label in &def.labels {
-            labels.push(Line::from(format!("{}={}", label.key, label.value)));
+        if !def.labels.is_empty() {
+            meta.push(field(
+                "Labels",
+                def.labels
+                    .iter()
+                    .map(|label| format!("{}={}", label.key, label.value))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
         }
 
-        Paragraph::new(labels)
-            .block(
-                Block::new()
-                    .title("Labels")
-                    .title_style(Style::new().bold())
-                    .borders(Borders::NONE),
-            )
-            .render(labels_area, buf);
+        let meta_height = u16::try_from(meta.len()).unwrap_or(4) + 1;
 
-        Paragraph::new(
-            serde_json::to_string_pretty(
-                &serde_json::from_str::<Value>(&def.input_payload_json).unwrap_or_default(),
-            )
-            .unwrap_or_default(),
-        )
-        .block(
-            Block::new()
-                .title(" Input ")
-                .borders(Borders::all())
-                .border_set(symbols::border::PLAIN),
-        )
-        .render(input, buf);
+        let [meta_area, payloads] =
+            Layout::vertical([Constraint::Length(meta_height), Constraint::Fill(1)])
+                .horizontal_margin(1)
+                .areas(inner);
 
-        Paragraph::new(match job.executions.last() {
+        Paragraph::new(meta).render(meta_area, buf);
+
+        // Stacked rather than side by side: the pane is far wider than tall.
+        let [input, output] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(payloads);
+
+        payload(
+            "Input",
+            &pretty_json(&def.input_payload_json),
+            None,
+            input,
+            buf,
+        );
+
+        match job.executions.last() {
             Some(exec) => match (exec.failure_reason.as_ref(), exec.output_json.as_ref()) {
-                (Some(reason), _) => reason.clone(),
-                (_, Some(output)) => serde_json::to_string_pretty(
-                    &serde_json::from_str::<Value>(output).unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-                _ => String::new(),
+                (Some(reason), _) => payload(
+                    "Output",
+                    reason,
+                    Some(Style::new().fg(tailwind::RED.c400)),
+                    output,
+                    buf,
+                ),
+                (_, Some(json)) => payload("Output", &pretty_json(json), None, output, buf),
+                _ => payload("Output", "", None, output, buf),
             },
-            None => String::new(),
-        })
+            None => payload("Output", "", None, output, buf),
+        }
+    }
+}
+
+/// A bordered, wrapping pane for a JSON payload or failure reason.
+fn payload(
+    title: &str,
+    text: &str,
+    style: Option<Style>,
+    area: ratatui::prelude::Rect,
+    buf: &mut ratatui::prelude::Buffer,
+) {
+    Paragraph::new(text.to_string())
+        .style(style.unwrap_or_default())
+        .wrap(Wrap { trim: false })
         .block(
             Block::new()
-                .title(" Output ")
+                .title(format!(" {title} "))
                 .borders(Borders::all())
-                .border_set(symbols::border::PLAIN),
+                .border_set(symbols::border::PLAIN)
+                .padding(Padding::horizontal(1)),
         )
-        .render(output, buf);
-    }
+        .render(area, buf);
+}
+
+/// When the job finished, with how long after its target time that was.
+fn finished_text(job: &Job) -> String {
+    let Some(ended) = job
+        .executions
+        .last()
+        .and_then(|exec| exec.succeeded_at.or(exec.failed_at).or(exec.cancelled_at))
+        .and_then(timestamp_of)
+    else {
+        return String::new();
+    };
+
+    let Some(target) = job
+        .job
+        .as_ref()
+        .and_then(|def| def.target_execution_time)
+        .and_then(timestamp_of)
+    else {
+        return format_time(Some(ended));
+    };
+
+    let duration = ended.duration_since(target);
+    let duration = duration
+        .round(SignedDurationRound::new().smallest(jiff::Unit::Millisecond))
+        .unwrap_or(duration);
+
+    format!("{} ({duration:#})", format_time(Some(ended)))
 }
