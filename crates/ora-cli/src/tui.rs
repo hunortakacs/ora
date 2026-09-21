@@ -156,6 +156,17 @@ impl ScheduleStatus {
     }
 }
 
+/// How close to the last loaded job the selection has to come before
+/// the next page is fetched.
+const PAGE_AHEAD: usize = 5;
+
+/// How many pages of jobs are loaded without being asked for.
+///
+/// The first fills the table early, the rest follow in the background.
+/// Pages past these come from scrolling and stop the table refreshing
+/// on its own, which would drop them.
+const JOB_AUTO_PAGES: usize = 2;
+
 /// An action that is only carried out
 /// once the user confirms it.
 #[derive(Debug)]
@@ -403,12 +414,37 @@ impl App {
                         self.job_type_selected(prev_selection, self.job_type_list.state.selected());
                     }
                 }
-                AppEvent::JobsUpdated(generation, jobs) => {
+                AppEvent::JobsUpdated(generation, jobs, next_page, append) => {
                     if generation == self.generation {
                         self.pending.finish(Request::Jobs);
-                        self.job_table.jobs = jobs;
+
+                        if append {
+                            self.job_table.incoming.extend(jobs);
+                            self.job_table.pages += 1;
+                        } else {
+                            self.job_table.incoming = jobs;
+                            self.job_table.pages = 1;
+                        }
+
+                        self.job_table.next_page = next_page;
+
+                        // A refresh starts over at the first page, so
+                        // showing each as it lands blinks the later
+                        // ones out. Wait, unless the table is empty
+                        // and there is nothing to lose by not waiting.
+                        let more = self.job_table.pages < JOB_AUTO_PAGES
+                            && self.job_table.next_page.is_some();
+
+                        if !more || self.job_table.jobs.is_empty() {
+                            self.job_table.jobs.clone_from(&self.job_table.incoming);
+                        }
+
                         self.data_updated();
                         self.refresh_detail();
+
+                        if more {
+                            self.load_more_jobs();
+                        }
                     }
                 }
                 AppEvent::SchedulesUpdated(generation, schedules) => {
@@ -620,7 +656,10 @@ impl App {
 
         match (self.tab, self.selected_job_type()) {
             (Tab::Jobs, Some(job_type_id)) => {
-                if force || self.pending.jobs.idle() {
+                // Refreshing on the timer would drop every page loaded
+                // past the first, so once one is loaded the table is
+                // only refreshed when asked for.
+                if force || (self.pending.jobs.idle() && self.job_table.pages <= JOB_AUTO_PAGES) {
                     self.pending.jobs.start(spawn(data::update_jobs(
                         self.generation,
                         job_type_id,
@@ -629,6 +668,7 @@ impl App {
                         self.client.clone(),
                         self.events.sender(),
                         self.label_filter(Tab::Jobs).to_string(),
+                        None,
                     )));
                 }
             }
@@ -657,9 +697,12 @@ impl App {
                     self.fetch_executor_jobs();
                 }
             }
-            // Without a job type there is nothing to filter by,
-            // the tables stay empty until the job types load.
-            (Tab::Jobs, None) => self.job_table.jobs.clear(),
+            // Without a job type there is nothing to filter by.
+            (Tab::Jobs, None) => {
+                self.job_table.jobs.clear();
+                self.job_table.incoming.clear();
+                self.job_table.next_page = None;
+            }
             (Tab::Schedules, None) => self.schedule_table.schedules.clear(),
         }
     }
@@ -696,7 +739,12 @@ impl App {
 
     fn clear_rows(&mut self, tab: Tab) {
         match tab {
-            Tab::Jobs => self.job_table.jobs.clear(),
+            Tab::Jobs => {
+                self.job_table.jobs.clear();
+                self.job_table.incoming.clear();
+                self.job_table.next_page = None;
+                self.job_table.pages = 0;
+            }
             Tab::Schedules => self.schedule_table.schedules.clear(),
             Tab::Executors => {}
         }
@@ -737,12 +785,38 @@ impl App {
             return;
         }
 
+        let len = self.selected_table_len();
         let state = self.selected_table_state();
 
         if forward {
             state.select_next();
         } else {
             state.select_previous();
+        }
+
+        let row = state.selected();
+
+        if let Some(row) = row {
+            self.reach_row(row, len);
+        }
+    }
+
+    /// Fetch the next page of jobs as the selection nears the end of
+    /// the ones already loaded, so that scrolling down keeps working
+    /// without the list having to be fetched whole up front.
+    fn reach_row(&mut self, row: usize, len: usize) {
+        if self.tab != Tab::Jobs || row + PAGE_AHEAD < len {
+            return;
+        }
+
+        self.load_more_jobs();
+    }
+
+    fn selected_table_len(&self) -> usize {
+        match self.tab {
+            Tab::Jobs => self.job_table.jobs.len(),
+            Tab::Schedules => self.schedule_table.schedules.len(),
+            Tab::Executors => self.executor_table.executors.len(),
         }
     }
 
@@ -922,6 +996,28 @@ impl App {
                 .schedule_table
                 .selected()
                 .is_some_and(|schedule| schedule.status() != ProtoScheduleStatus::Stopped)
+    }
+
+    /// Fetch the page after the rows already in the jobs table.
+    fn load_more_jobs(&mut self) {
+        if self.job_table.next_page.is_none() || !self.pending.jobs.idle() {
+            return;
+        }
+
+        let Some(job_type_id) = self.selected_job_type() else {
+            return;
+        };
+
+        self.pending.jobs.start(spawn(data::update_jobs(
+            self.generation,
+            job_type_id,
+            self.job_order,
+            self.job_status.statuses(),
+            self.client.clone(),
+            self.events.sender(),
+            self.label_filter(Tab::Jobs).to_string(),
+            self.job_table.next_page.clone(),
+        )));
     }
 
     fn confirm_cancel_job(&mut self) {

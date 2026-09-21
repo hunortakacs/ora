@@ -47,9 +47,12 @@ impl Events {
 pub(super) enum AppEvent {
     Term(crossterm::event::Event),
     JobTypesUpdated(Vec<JobTypeInfo>),
-    /// Carries the generation it was requested in so that
-    /// responses for superseded filters can be discarded.
-    JobsUpdated(u64, Vec<Job>),
+    /// One page of jobs, with the token for the page after it.
+    ///
+    /// Carries the generation it was requested in so that responses
+    /// for superseded filters can be discarded, and whether the rows
+    /// extend the table or replace it.
+    JobsUpdated(u64, Vec<Job>, Option<String>, bool),
     SchedulesUpdated(u64, Vec<Schedule>),
     ExecutorsUpdated(Vec<ExecutorInfo>),
     /// The jobs of one executor, carrying the executor ID they belong to.

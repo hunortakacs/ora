@@ -13,6 +13,13 @@ use crate::tui::{AppEvent, events::Request};
 /// The maximum number of items retrieved for any of the tables.
 const LIST_LIMIT: u32 = 100;
 
+/// How many jobs are fetched at a time.
+///
+/// One page is one round trip, so a job type with a lot of history
+/// shows its newest jobs straight away instead of after the whole
+/// limit has been walked.
+const JOB_PAGE_SIZE: u32 = 25;
+
 /// How many of an executor's jobs are shown in its detail view.
 const EXECUTOR_JOB_LIMIT: u32 = 25;
 
@@ -55,6 +62,7 @@ pub(super) async fn update_jobs(
     admin: AdminClient,
     events: Sender<AppEvent>,
     label_filter: String,
+    page_token: Option<String>,
 ) {
     let filters = JobFilters {
         job_type_ids: Some(vec![job_type]),
@@ -63,17 +71,19 @@ pub(super) async fn update_jobs(
         ..Default::default()
     };
 
+    let append = page_token.is_some();
+
     let event = match request(
         "jobs",
-        admin
-            .list_jobs(filters, order, Some(LIST_LIMIT))
-            .try_collect::<Vec<_>>(),
+        admin.list_jobs_page(filters, order, JOB_PAGE_SIZE, page_token),
     )
     .await
     {
-        Ok(jobs) => AppEvent::JobsUpdated(
+        Ok((jobs, next_page)) => AppEvent::JobsUpdated(
             generation,
             jobs.into_iter().filter_map(ora::Job::into_raw).collect(),
+            next_page,
+            append,
         ),
         Err(error) => AppEvent::Failed(Request::Jobs, error, Some(generation)),
     };
