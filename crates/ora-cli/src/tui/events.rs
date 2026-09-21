@@ -61,6 +61,10 @@ pub(super) enum AppEvent {
     /// footer. Carries the generation it was made in, where the
     /// request was one the filters apply to.
     Failed(Request, String, Option<u64>),
+    /// A job or schedule was created from the form.
+    Created,
+    /// Creating from the form failed, the message stays on the form.
+    CreateFailed(String),
     Refresh,
     /// Advances the loading indicator and keeps
     /// relative times in the footer current.
